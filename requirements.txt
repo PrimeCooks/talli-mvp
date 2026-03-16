@@ -1,0 +1,17 @@
+# TALLI — Task-Adaptive LLM Inference
+# requirements.txt
+
+# Core ML
+torch>=2.0.0
+transformers>=4.36.0
+accelerate>=0.25.0
+
+# API Server
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# Optional: better task classification
+sentence-transformers>=2.2.0
+
+# Utilities
+pydantic>=2.0.0
