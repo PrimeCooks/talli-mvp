@@ -137,7 +137,7 @@ class TALLIInference:
         except Exception as e:
             return f"Error: {e}"
     
-    def _generate_stream(self, payload: dict) -> Generator[str, None, None):
+    def _generate_stream(self, payload: dict):
         """Streaming generation"""
         try:
             resp = requests.post(
