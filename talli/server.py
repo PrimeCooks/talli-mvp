@@ -1,239 +1,210 @@
 """
-TALLI Server — Ollama-compatible API
-Allows TALLI to be used as a drop-in Ollama replacement
+TALLI Server — Ollama-Compatible API
+Routes to local Ollama models with task-aware features
 """
-import os
-import json
-import time
-import threading
-from typing import Optional
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse, JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from typing import Optional, List, Dict
+import uvicorn
+import argparse
+import json
 
 from .inference_engine import TALLIInference
 
-
-app = FastAPI(title="TALLI", version="0.1.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="TALLI Server")
 
 # Global engine instance
 engine: Optional[TALLIInference] = None
-model_name = os.environ.get("TALLI_MODEL", "llama3-8b")
+
+
+class GenerateRequest(BaseModel):
+    model: str
+    prompt: str
+    stream: bool = False
+    options: Dict = {}
+    
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatRequest(BaseModel):
+    model: str
+    messages: List[ChatMessage]
+    stream: bool = False
+    options: Dict = {}
 
 
 @app.on_event("startup")
 async def startup():
     global engine
     print("🚀 Starting TALLI Server...")
-    engine = TALLIInference(model_name=model_name, use_gpu=True)
-
-
-@app.get("/")
-async def root():
-    return {"name": "TALLI", "version": "0.1.0", "status": "running"}
+    engine = TALLIInference(
+        model_name=app.state.model_name,
+        ollama_host=app.state.ollama_host,
+    )
+    print("✅ TALLI Server ready!")
 
 
 @app.get("/api/tags")
 async def list_models():
     """Ollama-compatible: list available models"""
-    return {
-        "models": [
-            {
-                "name": f"talli-{model_name}",
-                "model": f"talli-{model_name}",
-                "modified_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "size": 5000000000,
-                "digest": "sha256:talli-mvp",
-                "details": {
-                    "family": "talli",
-                    "families": ["talli"],
-                    "parameter_size": "8B",
-                    "quantization_level": "FP16"
-                }
-            }
-        ]
-    }
-
-
-@app.get("/api/show")
-async def show_model(request: Request):
-    """Ollama-compatible: show model info"""
-    body = await request.json()
-    name = body.get("name", model_name)
-    return {
-        "license": "Apache 2.0",
-        "modelfile": f"FROM {name}",
-        "parameters": "temperature 0.7",
-        "template": "{{ .System }}\n{{ .Prompt }}",
-        "details": {
-            "family": "talli",
-            "parameter_size": "8B"
-        }
-    }
+    import requests
+    try:
+        resp = requests.get(f"{engine.ollama_host}/api/tags", timeout=10)
+        return resp.json()
+    except Exception as e:
+        return {"models": [], "error": str(e)}
 
 
 @app.post("/api/generate")
-async def generate(request: Request):
-    """Ollama-compatible: text generation"""
-    body = await request.json()
-    prompt = body.get("prompt", "")
-    stream = body.get("stream", False)
-    max_tokens = body.get("options", {}).get("num_predict", 256)
-    temperature = body.get("options", {}).get("temperature", 0.7)
+async def generate(request: GenerateRequest):
+    """Ollama-compatible: generate text"""
+    import requests
     
-    if not prompt:
-        return JSONResponse({"error": "No prompt provided"}, status_code=400)
+    # Classify the task
+    task_type = engine.classify_task(request.prompt)
     
-    if stream:
-        return StreamingResponse(
-            stream_generate(prompt, max_tokens, temperature),
-            media_type="application/x-ndjson"
-        )
-    
-    # Non-streaming response
-    response = engine.generate(
-        query=prompt,
-        max_new_tokens=max_tokens,
-        temperature=temperature
-    )
-    
-    task_type = engine.classify_task(prompt)
-    
-    return {
-        "model": f"talli-{model_name}",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "response": response,
-        "done": True,
-        "context": [],
-        "total_duration": 0,
-        "eval_count": len(response.split()),
-        "task_type": task_type,  # TALLI-specific
-        "segments": engine.get_segment_layers(task_type),  # TALLI-specific
+    payload = {
+        "model": request.model,
+        "prompt": request.prompt,
+        "stream": request.stream,
+        "options": request.options,
     }
-
-
-async def stream_generate(prompt: str, max_tokens: int, temperature: float):
-    """Stream generation response"""
-    response = engine.generate(
-        query=prompt,
-        max_new_tokens=max_tokens,
-        temperature=temperature
-    )
     
-    # Stream word by word
-    words = response.split()
-    for i, word in enumerate(words):
-        chunk = {
-            "model": f"talli-{model_name}",
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "response": word + " ",
-            "done": False,
+    if request.stream:
+        def stream_generator():
+            resp = requests.post(
+                f"{engine.ollama_host}/api/generate",
+                json={**payload, "stream": True},
+                stream=True,
+                timeout=120
+            )
+            for line in resp.iter_lines():
+                if line:
+                    yield line.decode() + "\n"
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+    else:
+        resp = requests.post(
+            f"{engine.ollama_host}/api/generate",
+            json=payload,
+            timeout=120
+        )
+        result = resp.json()
+        # Add TALLI metadata
+        result["_talli"] = {
+            "task_type": task_type,
+            "routed_from": "talli",
         }
-        yield json.dumps(chunk) + "\n"
-        time.sleep(0.01)
-    
-    # Final chunk
-    yield json.dumps({
-        "model": f"talli-{model_name}",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "response": "",
-        "done": True,
-    }) + "\n"
+        return result
 
 
 @app.post("/api/chat")
-async def chat(request: Request):
+async def chat(request: ChatRequest):
     """Ollama-compatible: chat format"""
-    body = await request.json()
-    messages = body.get("messages", [])
-    stream = body.get("stream", False)
+    import requests
     
-    if not messages:
-        return JSONResponse({"error": "No messages provided"}, status_code=400)
+    # Classify based on last user message
+    last_user_msg = ""
+    for msg in request.messages:
+        if msg.role == "user":
+            last_user_msg = msg.content
     
-    # Convert messages to prompt
-    last_message = messages[-1].get("content", "")
+    task_type = engine.classify_task(last_user_msg) if last_user_msg else "chat"
     
-    # Build context from previous messages
-    context = ""
-    for msg in messages[:-1]:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        context += f"{role}: {content}\n"
-    
-    prompt = f"{context}user: {last_message}\nassistant:" if context else last_message
-    
-    response = engine.generate(query=prompt, max_new_tokens=256, temperature=0.7)
-    task_type = engine.classify_task(last_message)
-    
-    return {
-        "model": f"talli-{model_name}",
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "message": {
-            "role": "assistant",
-            "content": response
-        },
-        "done": True,
-        "task_type": task_type,
+    payload = {
+        "model": request.model,
+        "messages": [m.dict() for m in request.messages],
+        "stream": request.stream,
+        "options": request.options,
     }
+    
+    if request.stream:
+        def stream_generator():
+            resp = requests.post(
+                f"{engine.ollama_host}/api/chat",
+                json={**payload, "stream": True},
+                stream=True,
+                timeout=120
+            )
+            for line in resp.iter_lines():
+                if line:
+                    yield line.decode() + "\n"
+        return StreamingResponse(stream_generator(), media_type="application/x-ndjson")
+    else:
+        resp = requests.post(
+            f"{engine.ollama_host}/api/chat",
+            json=payload,
+            timeout=120
+        )
+        result = resp.json()
+        result["_talli"] = {
+            "task_type": task_type,
+            "routed_from": "talli",
+        }
+        return result
 
 
 # TALLI-specific endpoints
 
 @app.get("/api/talli/stats")
 async def talli_stats():
-    """TALLI-specific: Get inference statistics"""
-    if engine:
-        return engine.get_stats()
-    return {"error": "Engine not initialized"}
-
-
-@app.get("/api/talli/segments/{task_type}")
-async def talli_segments(task_type: str):
-    """TALLI-specific: Get segments for a task type"""
-    if engine:
-        segments = engine.get_segment_layers(task_type)
-        return {
-            "task_type": task_type,
-            "segments": segments,
-            "attention_count": len(segments.get("attention_layers", [])),
-            "ffn_count": len(segments.get("ffn_layers", [])),
-        }
-    return {"error": "Engine not initialized"}
+    """TALLI-specific: get inference stats"""
+    return engine.get_stats()
 
 
 @app.get("/api/talli/classify")
 async def talli_classify(query: str):
-    """TALLI-specific: Classify a query"""
-    if engine:
-        task_type = engine.classify_task(query)
-        segments = engine.get_segment_layers(task_type)
-        return {
-            "query": query,
-            "task_type": task_type,
-            "segments_to_load": segments,
-        }
-    return {"error": "Engine not initialized"}
+    """TALLI-specific: classify a query without generating"""
+    task_type = engine.classify_task(query)
+    return {
+        "query": query,
+        "task_type": task_type,
+        "model": engine.get_model_for_task(task_type),
+    }
 
 
-def run_server(model: str = "llama3-8b", host: str = "0.0.0.0", port: int = 11434):
-    """Run the TALLI server"""
-    import uvicorn
-    global model_name
-    model_name = model
-    print(f"🌐 TALLI Server starting on {host}:{port}")
-    print(f"   Model: {model}")
+@app.get("/api/talli/tasks")
+async def talli_tasks():
+    """TALLI-specific: list task types"""
+    return {
+        "tasks": [
+            {"type": "code", "icon": "💻", "description": "Programming, debugging, code review"},
+            {"type": "creative", "icon": "🎨", "description": "Writing, storytelling, brainstorming"},
+            {"type": "reasoning", "icon": "🧠", "description": "Analysis, math, logic"},
+            {"type": "chat", "icon": "💬", "description": "Casual conversation"},
+            {"type": "multilingual", "icon": "🌍", "description": "Translation, multilingual"},
+        ]
+    }
+
+
+@app.get("/health")
+async def health():
+    """Health check"""
+    return {"status": "ok", "engine": "talli", "connected": True}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="TALLI Server (Ollama)")
+    parser.add_argument("--model", default="llama3.2", help="Default Ollama model")
+    parser.add_argument("--port", type=int, default=11434, help="Port to run on")
+    parser.add_argument("--host", default="0.0.0.0", help="Host to bind")
+    parser.add_argument("--ollama", default="http://localhost:11434", help="Ollama host URL")
+    args = parser.parse_args()
+    
+    app.state.model_name = args.model
+    app.state.ollama_host = args.ollama
+    
+    print(f"🌐 TALLI Server starting on {args.host}:{args.port}")
+    print(f"   Default model: {args.model}")
+    print(f"   Ollama backend: {args.ollama}")
     print(f"   Ollama-compatible: YES")
     print(f"   Task-aware routing: YES")
-    uvicorn.run(app, host=host, port=port)
+    
+    uvicorn.run(app, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":
-    run_server()
+    main()
