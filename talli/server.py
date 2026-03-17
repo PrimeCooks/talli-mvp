@@ -3,7 +3,7 @@ TALLI Server — Ollama-Compatible API
 Routes to local Ollama models with task-aware features
 """
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 import uvicorn
@@ -46,6 +46,13 @@ async def startup():
         ollama_host=app.state.ollama_host,
     )
     print("✅ TALLI Server ready!")
+
+
+@app.get("/", response_class=HTMLResponse)
+async def ui():
+    """Web UI for TALLI chat"""
+    from .ui import get_ui_html
+    return get_ui_html()
 
 
 @app.get("/api/tags")
